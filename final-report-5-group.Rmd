@@ -1,0 +1,1118 @@
+---
+title: "Итоговый проект"
+author: "Группа 5"
+output: 
+  html_document:
+    code_folding: hide
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+### Предобработка
+
+Загрузка необходимых пакетов:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+library(tidyverse)
+library(stringr)
+library(SnowballC)
+library(dplyr)
+library(ggraph)
+library(igraph)
+library(tidyr)
+library(LDAvis) 
+library(topicmodels)
+library(tidytext)
+library(recommenderlab)
+```
+
+#### Текстовый анализ
+
+Перед построением рекомендательных систем мы решили провести текстовый
+анализ, а именно оценку тональности и LDA-анализ, чтобы выявить новые
+характеристики фильмов, которые можно было бы использовать впоследствии
+в content-based системе. Перед этим мы с сайта kaggle выгрузили дата-сет
+с дополнительными характеристиками, которые также решили использовать.
+
+Выгрузка дополнительного дата-сета:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+df1 <- read.csv("~/shared/minor2_2022_5/movies_initial.csv")
+```
+
+Из этого дата-сета мы решили взять дополнительные харакетристики: год
+выхода фильма, жанр, описание фильмов. Описание фильмов мы решили
+использовать для текстового анализа, так как у большого количества
+фильмов не было тегов, а описание фильма почти у всех появилось.
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+load("~/shared/minor2_2022/data/project/metadata_g_5.RData")
+load("~/shared/minor2_2022/data/project/ratings_g_5.RData") #загрузили исходные дата-сеты
+df1 = df1 %>% rename(imdbId = imdbID)
+df1 = df1 %>% select(imdbId, year, genre, plot) 
+metadata$imdbId = as.integer(metadata$imdbId)
+newdata = left_join(metadata, df1, by='imdbId') #соединяем дата-сеты
+newdata = distinct(newdata) #убираем дублирующие строки
+```
+
+Попробуем выделить тональность на основе описания фильмов с помощью
+словаря afinn, предварительно проведя лемматизацию слов:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+afinn_sent = get_sentiments("afinn") #загрузка словаря с тональностью 
+plot = newdata %>% 
+  select(item_id, plot) %>% 
+  unnest_tokens(word, plot)
+
+plot$word = str_to_lower(plot$word)
+stopwords = data.frame(word=stopwords::stopwords("en"), stringsAsFactors=FALSE)
+plot = plot %>%
+  anti_join(stopwords)
+```
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+#лемматизация
+plot$lem = wordStem(plot$word, language = "english") #из library(SnowballC)
+```
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+plot = plot %>% inner_join(afinn_sent)
+plot_count = plot %>% group_by(item_id) %>% summarise(mean = mean(value))
+newdata = left_join(newdata, plot_count)
+newdata = distinct(newdata) #убираем дублирующие строки
+s = sum(is.na(newdata$mean)) #получается 90/500 пропущенных
+```
+
+Получилось, что у 90 фильмов отсутсвует оценка тональности на основании
+описаня фильмов. Попробуем выделить тональность на основе тегов и
+"восполнить" пропуски.
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+tag = inner_join(tags, survey_answers, by=c("id"="tag_id"))
+#посмотрим на среднюю оценку тега
+mean_score = tag %>% group_by(item_id, id) %>% summarise(mean = mean(score))
+# будем считать, что теги со средней оценкой >1 подходят фильмам
+mean_score = mean_score %>% filter(mean > 1)
+film_tag = newdata %>% select(item_id) %>% inner_join(tag) %>% select(item_id, id, tag)
+film_tag = film_tag %>% 
+  select(item_id, id, tag) %>% 
+  unnest_tokens(word, tag)
+
+film_tag$lem = wordStem(film_tag$word, language = "english")
+
+film_tag = film_tag %>% inner_join(afinn_sent, by=c("lem"="word"))
+film.sent_count = film_tag %>% 
+  group_by(item_id) %>% 
+  summarise(mean = mean(value)) 
+film.sent_count = film.sent_count %>% rename(mean1 = mean)
+
+newdata = newdata %>% full_join(film.sent_count, by="item_id")
+newdata$mean[is.na(newdata$mean)] = newdata$mean1[is.na(newdata$mean)] #заполняем пропуски значениями из столбца с тональностью по тегам
+s = sum(is.na(newdata$mean)) #теперь только 68 пропущенныхданных
+newdata = newdata %>% select(-mean1)
+newdata = newdata %>% rename(sentiment = mean)
+```
+
+После заполнения пропусков с помощью тональности тегов, осталось 68
+пропущенных данных. Заполним оставшиеся пропуски с помощью метода
+импутации, а именно: заполнение пропущенных строк средним значением.
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+newdata$sentiment[is.na(newdata$sentiment)] = mean(newdata$sentiment, na.rm = TRUE)
+```
+
+Теперь оценку тональности можно использовать для построения
+Content-based системы.
+
+Попробуем теперь выделить темы у фильмов на основании описаний с помощью
+LDA:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+word_counts = plot %>% 
+  count(item_id, lem, sort = TRUE) %>%
+  ungroup()
+
+plot_dtm <- word_counts %>% cast_dtm(item_id,lem, n)
+plot_lda <- LDA(plot_dtm, k = 10, control = list(seed = 12345))
+
+topics <- tidy(plot_lda, matrix = "beta")
+
+terms <- topics %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+terms %>%
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip()
+```
+
+В ходе эксперементов в различными значениями параметра k (от 2 до 15),
+не получилось выделить темы фильмов, которые как-либо друг от друга
+отличались, поэтому данную характеристику мы не будем использовать для
+дальнейшего построения content-based системы.
+
+#### Cетевой анализ
+
+Начнём с того, что данный метод изначально предполагался как
+эксперементальный, но в итоге он был внедрён в рекомендательную систему.
+На первом шаге произведем обработку датасета: разбиение списка актеров
+по запятой и объединение в список
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+#разбиение списка актеров по запятой и объединение в список
+metadata$actor_list <- lapply(strsplit(metadata$starring, ","), function(x) as.character(x))
+```
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+#Создание объединенного датасета для дальнейшего создания фрейма: (фильм-актёр)
+df = select(metadata, title, actor_list)
+```
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+
+#блок создания фрейма: (фильм-актёр)
+edge = c()
+for (i in 1:nrow(df)) {
+  for (j in 1:length(df$actor_list[[i]])) {
+  edge = c(edge, df$title[i], df$actor_list[[i]][j])
+}
+}
+movies_actors = matrix(edge, ncol = 2, byrow = TRUE)
+df_from_net = data.frame(film = movies_actors[,1], actor = movies_actors[,2])
+
+#удалим лишние пробелы в колонках
+df_from_net$film = trimws(df_from_net$film)
+df_from_net$actor = trimws(df_from_net$actor)
+```
+
+На данном этапе представлена работа с python для предобработки данных
+
+```{r eval=FALSE, include=FALSE}
+#Загрузка модуля pandas
+import pandas as pd
+#загрузка данных
+df = pd.read_csv("my_df.csv")
+df.dropna()
+#Создание списка фильмов
+s = (df['film'])
+film_list = []
+for i in s:
+    film_list.append(i)
+#Создание списка актёров
+s = (df['actor'])
+actor_list = []
+for i in s:
+    actor_list.append(i)
+#Создание словаря {актер : [фильмы]}
+sp = {}
+for i in range(len(actor_list)):
+    if actor_list[i] not in sp:
+        sp[actor_list[i]] = [film_list[i]]
+    else:
+        sp[actor_list[i]].append(film_list[i])
+#Очищаем словарь от актёров, которые снимались только в 1 фильме
+sp_clean = {}
+for i,v in sp.items():
+    if len(v) > 1:
+        sp_clean[i] = v
+#Создаём пары "фильм-фильм""
+st = []
+for i,v in sp_clean.items():
+    for z in v:
+        for x in range(len(v)):
+            st.append((z, v[x]))
+st = set(st)
+st = sorted(st, key = lambda a: a[0])
+sd = []
+for i in st:
+    if i[0] != i[1]:
+        sd.append(i)
+        
+#Записываем в файл csv, с которым работаем дальше в R        
+with open('df_end.csv', 'w', encoding = 'utf-8') as f:
+    print(f'"Film_1","Film_2"', file = f)
+    for i in sd:
+        print(f'"{i[0]}","{i[1]}"', file = f)
+```
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+network_dataset = read_csv("~/shared/minor2_2022_5/Seti/df_end.csv") #датасет, в котором связи между фильмами на основе актеров
+
+```
+
+Приступаем к построению сети:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+g = graph_from_data_frame(d = network_dataset, directed = F)
+plot(g,
+     vertex.size = 3,
+     vertex.label = NA,
+     edge.color = "black")
+
+```
+
+Сам граф нам мало о чём говорит - его сложно интерпретировать. Посмотрим
+на характеристики сети.
+
+```{r}
+g
+```
+
+В сети 477 вершин (некоторые фильмы не вошли, так как у них не оказалось
+связей ни с одним фильмом) и почти 8 тысяч связей.
+
+Почему Walktrap? "Подход, основанный на случайных путях. Основная идея
+-- если случайно"блуждать" по графу, то больше шансов, что ваш путь
+будет чаще оставаться внутри сообщества и только иногда выходить за его
+пределы."\* (цитата из lab02-centrality) К тому же данный метод в
+представленной системе даёт более вариативное разбиение на комьюнити.
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+#работа с сообществами
+set.seed(1111)
+wtcommune = walktrap.community(g)
+com = wtcommune$membership
+names = wtcommune$names
+data = data_frame(com, names)
+metadata$names = metadata$title
+final_dataset = full_join(metadata, data, by = "names")
+
+final_dataset[is.na(final_dataset)] = 0
+final_dataset = final_dataset %>% 
+  select(-actor_list)
+
+#write.csv(final_dataset, "df_from_project.csv")
+```
+
+Згачение модулярности у walktrap.community:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+modularity(wtcommune)
+```
+
+Значение модулярности у fastgreedy.community:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+set.seed(123)
+g = simplify(g)
+fast = fastgreedy.community(g)
+modularity(fast)
+#membership(fast)
+
+#ebc = edge.betweenness.community(g)
+#Начинается бесконечная загрузка
+```
+
+Несмотря на то, что модулярность немного повыше у метода
+fastgreedy.community, но более вариативную разбивку мы получаем по
+методу walktrap.community, поэтому именно его мы будем использовать для
+выявления сообществ, также модулярность практически равна 0.3. Значение
+модулярности, лежащее в диапазоне от **0**.**3** до 0.7, означает, что
+сеть имеет вполне различимую структуру с сообществами, и применение
+алгоритма обнаружения сообществ имеет смысл.
+
+По итогу сетевого анализа мы добавляем в набор данных такую
+характеристику как принадлежность к тому или иному комьюнити.
+Результатом стало выделение 34+1 комьюнити, которые по значению
+модулярности оказались обоснованно введёнными:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+newdata$community_id <- final_dataset$com
+```
+
+В дальнейшем для системы, основанной на контенте, комьюнити будет
+рассматриваться как фактор, то есть для каждого комьюнити будет создан
+отдельный столбец.
+
+### Коллаборативная фильтрация
+
+Присутпаем к построению коллаборативной фильтрации. Перед этим
+обработаем данные, чтобы было удобно использовать в построении модели:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+#Преобразуем к таблице в "широком" формате
+rates = pivot_wider(ratings, names_from = item_id, values_from = rating)
+
+#Оставляем только оценки
+userNames = rates$user_id
+rates = select(rates, -user_id)
+
+#Преобразование таблицы данных в матрицу
+rates = as.matrix(rates)
+rownames(rates) = userNames
+#Преобразование матрицы в realRatingMatrix
+r = as(rates, "realRatingMatrix", strict = T)
+
+#Убираем нерелевантные данные, более подробно, почему мы так сделали есть в ответах на вопросы peer review
+ratings_movies <- r[rowCounts(r) > 15, colCounts(r) > 10] 
+```
+
+Теперь можно построить модель коллаборативной фильтрации. Мы решили
+построить и IBCF, и UBCF, чтобы сравнить и выбрать наилучшую.
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+#Разбиение данных на выборки с помощью 'evaluationScheme'
+set.seed(100)
+eval_sets <- evaluationScheme(data = ratings_movies, 
+                              method = "split",
+                              train = 0.8, # доля обучающей выборки
+                              given = 15, # сколько оценок используется для  предсказания
+                              goodRating = 4) # если предсказанная оценка < 4, то фильм не рекомендуем
+```
+
+Модель IBCF: Строим модель на обучающей, предсказываем на тестовой:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+recc_model_IB <-
+  Recommender(data = getData(eval_sets, "train"), method ="IBCF")
+
+recc_predicted_IB <-
+  predict(
+    object = recc_model_IB,
+    newdata = getData(eval_sets, "known"),
+    n = 10,
+    type = "ratings"
+  )
+```
+
+Ищем усредненную accuracy для всех пользователей:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+eval_accuracy_IB <- calcPredictionAccuracy(
+      x = recc_predicted_IB,# predicted values
+      data = getData(eval_sets, "unknown"),
+      byUser = F) # not averaging for each user
+
+eval_accuracy_IB
+```
+
+Модель UBCF: Строим модель на обучающей, предсказываем на тестовой:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+recc_model_UB <-
+  Recommender(data = getData(eval_sets, "train"), method ="UBCF")
+
+recc_predicted_UB <-
+  predict(
+    object = recc_model_UB,
+    newdata = getData(eval_sets, "known"),
+    n = 10,
+    type = "ratings"
+  )
+```
+
+Ищем усредненную accuracy для всех пользователей:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+eval_accuracy_UB <- calcPredictionAccuracy(
+      x = recc_predicted_UB,# predicted values
+      data = getData(eval_sets, "unknown"),
+      byUser = F) # not averaging for each user
+
+eval_accuracy_UB
+```
+
+Мы выбрали для оценивания качесва модели RMSE. Видим, что ошибка меньше
+в случае user-based модели, поэтому далее для предсказаний будем
+использовать ее.
+
+Пример использования: Возьмем пользователя с id=36989 и посмотрим, какие
+фильмы предсказала наша модель:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+recc_predicted = predict(object = recc_model_UB, newdata = ratings_movies, n = 10)
+
+names(recc_predicted@items) = rownames(ratings_movies)
+recc_user_1 = recc_predicted@items[["36989"]]
+movies_user_1 = recc_predicted@itemLabels[recc_user_1]
+names_movies_user_1 = metadata$title[match(movies_user_1, metadata$item_id)]
+names_movies_user_1
+
+names(recc_predicted@ratings) = rownames(ratings_movies)
+```
+
+Дополнительно рассматриваем случай, когда рекомендация нужна новому
+пользователю:
+
+1.  Получим список пользователей
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+all_users = unique(ratings$user_id)
+```
+
+2.  Получим топ 10 фильмов по общему рейтингу из metadata
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+top_movies = head(metadata[order(-metadata$avgRating), "item_id"], 10)#топ фильмов, который будет выводиться для обеих моделей, если такого пользователя нет в отобранном списке
+```
+
+3.  Получаем предсказание
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+#user = '907977'
+#user = '12345'
+user = '356'
+#user = '753874'
+if (user %in% all_users == 0){
+  movies_user = top_movies
+} else {
+  
+    recc_predicted = predict(object = recc_model_UB, newdata = ratings_movies, n = 10)
+    names(recc_predicted@items) = rownames(ratings_movies)
+    recc_user = recc_predicted@items[[user]]
+    movies_user = recc_predicted@itemLabels[recc_user]
+  }
+names_movies_user <- metadata$title[match(movies_user, metadata$item_id)]
+names_movies_user
+```
+
+Функция:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+
+getUserBasedRecommendation=function(userId){
+  
+  if (as.character(userId) %in% rownames(ratings_movies) == 0){
+    movies_user = top_movies
+  } else {
+    
+    recc_predicted = predict(object = recc_model_UB, newdata = ratings_movies, n = 10) #в плане нами было указано, что пользователь получает 10 фильмов
+    
+    names(recc_predicted@items) = rownames(ratings_movies)
+    recc_user_1 = recc_predicted@items[[as.character(userId)]]
+    movies_user= recc_predicted@itemLabels[recc_user_1]
+   }
+  names_movies_user <- metadata$title[match(movies_user, metadata$item_id)]
+  names_movies_user
+}
+```
+
+Пример работы функции:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+userId=122658#предполагается ввод индекса в формате числа
+getUserBasedRecommendation(userId)
+```
+
+**Оценивание рекомендации:** Оценка на адекватность и внутренняя оценка
+
+Для оценки качества модели методом коллаборативной фильтрации мы решили
+использовать RMSE и внутреннюю пользовательскую оценку. **RMSE** (Root
+Mean Squared Error) в рекомендательной системе фильмов для UBCF является
+метрикой оценки точност. предсказаний модели. Она измеряет разницу между
+фактическими рейтингами фильмов, которые пользователи дали, и
+предсказанными рейтингами модели. Оценка RMSE модели показала, что
+отклонение составляет около 1.08 балла по пятибалльной шкале, что хоть и
+не слишком мало, однако вполне допустимо в данном случае. Также
+получившееся значение меньше метрики RMSE у модели IBCF, откуда делаем
+вывод, что полученный показатель говорит о достаточно неплохой точности.
+Далее, после получения вопросов и комментариев от других студентов, мы с
+помощью цикла дополнительно проверили, грамотно ли подобраны границы
+отсечения, можно ли изменив их значительно уменьшить RMSE. По
+результатам такой проверки оказалось, что можно сократить RMSE до 0.98
+балла, однако при этом пришлось бы оставить лишь пользователей и фильмы,
+у которых более 30 и 5 оценок соответственно, что слишком бы сократил
+выборку. Так что подобранное изначально отсечение является оптимальным
+вариантом, с точки зрения сохранения наблюдений и качества.
+
+**Внутренняя оценка:**
+
+Оценим рекомендации, которая дала система рандомно выбранному
+пользователю на предмет того, насколько схожи фильмы, исходя из
+собственных соображений, и насколько мы были бы удовлетворены таким
+подбором
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+userId=633629#предполагается ввод индекса в формате числа
+getUserBasedRecommendation(userId)
+```
+
+Это пользователь, который ставил оценки "5" фильмам в жанре приключения
+и ужасы. Как мы видим, подборка для такого набора вполне уместная, что
+говорит о качестве работы системы (о правильности построения логики
+модели).
+
+### Content-based рекомендация
+
+Для построения content-based мы решили использовать оценку тональности,
+разбиение на сообщества, жанр, среднюю оценку фильма, десятилетие выхода
+фильма.
+
+Подготовим характеристики к построению модели:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+#Разбивка годов на десятилетия:
+newdata$year = as.numeric(newdata$year)
+newdata$decade = cut(newdata$year, breaks= c(1990, 2000, 2010, 2020, 2030), labels=c(1990, 2000, 2010, 2020))
+newdata$decade_num = as.numeric(newdata$decade)
+
+#Создание столбцов-жанров:
+newdata$animation = as.numeric(str_detect(newdata$genre, "Animation"))
+newdata$adventure = as.numeric(str_detect(newdata$genre, "Adventure"))
+newdata$comedy = as.numeric(str_detect(newdata$genre, "Сomedy"))
+newdata$drama = as.numeric(str_detect(newdata$genre, "Drama"))
+newdata$romance = as.numeric(str_detect(newdata$genre, "Romance"))
+newdata$action = as.numeric(str_detect(newdata$genre, "Action"))
+newdata$sci_fi = as.numeric(str_detect(newdata$genre, "Sci"))
+newdata$crime = as.numeric(str_detect(newdata$genre, "Crime"))
+newdata$fantasy = as.numeric(str_detect(newdata$genre, "Fantasy"))
+newdata$biography = as.numeric(str_detect(newdata$genre, "Biography"))
+newdata$thriller = as.numeric(str_detect(newdata$genre, "Thriller"))
+newdata$mystery = as.numeric(str_detect(newdata$genre, "Mystery"))
+newdata$family = as.numeric(str_detect(newdata$genre, "Family"))
+newdata$sport = as.numeric(str_detect(newdata$genre, "Sport"))
+newdata$horror = as.numeric(str_detect(newdata$genre, "Horror"))
+newdata$music = as.numeric(str_detect(newdata$genre, "Music"))
+newdata$history = as.numeric(str_detect(newdata$genre, "History"))
+newdata$documentary = as.numeric(str_detect(newdata$genre, "Documentary"))
+newdata$western = as.numeric(str_detect(newdata$genre, "Western"))
+newdata$musical = as.numeric(str_detect(newdata$genre, "Musical"))
+newdata$short = as.numeric(str_detect(newdata$genre, "Short"))
+newdata$war = as.numeric(str_detect(newdata$genre, "War"))
+
+#Создание столбцов комьюнити:
+newdata = newdata %>% pivot_wider( names_from = community_id, values_from = community_id, values_fn = length, values_fill = 0, names_prefix = "N_")
+```
+
+Преобразование дата-сета:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+data1 = newdata %>% dplyr::select(avgRating, item_id, decade_num, sentiment, N_0, N_1, N_2, N_3, N_4, N_5,N_6,N_7,N_8,N_9,N_10,N_11,N_12,N_13,N_14,N_15,N_16,N_17,N_18,N_19, N_20,N_21,N_22,N_23,N_24,N_25,N_26,N_27,N_28,N_29,N_30,N_31,N_32,N_33,N_34, animation, adventure, comedy, drama,romance,action,sci_fi,crime,fantasy,biography,thriller,mystery, family,sport,horror,music,history,documentary,western,musical,short,war)
+rownames = data1$item_id
+data1 = data1 %>% dplyr::select(-item_id)
+rownames(data1) = rownames
+```
+
+Теперь можно приступить к построению рекомендательной системы:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+#Создаем матрицу схожести, используя косинусное расстояние.
+sim1 = lsa::cosine(t(as.matrix(data1)))
+
+#Проставим на главную диагональ 0, чтобы не получалось, что фильм больше всего похож сам на себя.
+diag(sim1) = 0
+```
+
+Выводим рекомендацию для пользователя 38859:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+user = ratings %>% filter(user_id == 38859 & rating == 5)
+#newdata %>% filter(item_id %in% user$item_id) %>% select(title, item_id)
+
+mostSimilar = max(sim1[,as.character(user$item_id[1])], na.rm = T)
+a = which(sim1[,as.character(user$item_id[1])] == mostSimilar, arr.ind = TRUE)
+
+result = names(a)
+#filter(newdata,item_id == result) %>% select(title)
+```
+
+Находим топ-10 фильмов с наибольшим показателем схожести.
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+mostSimilar = head(sort(sim1[,as.character(user$item_id[2])], decreasing = T), n = 10)
+
+#filter(newdata,item_id %in% result) %>% dplyr::select(title)
+
+mostSimilar = data.frame(similar = mostSimilar)
+mostSimilar$item_id = as.numeric(rownames(mostSimilar))
+
+```
+
+Оставим в матрице только нужные нам столбцы (т.е. соответствующие
+фильмам с высокой оценкой у рассматриваемого пользователя) в матрице
+схожести. Находим максимальное значение схожести по всем фильмам сразу и
+выводим рекомендацию.
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+simCut = sim1[,as.character(user$item_id)]
+
+mostSimilar = max(simCut, na.rm = T)
+a = which(simCut == mostSimilar, arr.ind = TRUE)
+
+#filter(newdata,item_id %in% result) %>% dplyr::select(title)
+```
+
+Сейчас выводим несколько рекомендаций сразу, упорядочиваем по убыванию
+схожести.
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+mostSimilar = head(sort(simCut, decreasing = T), n = 10)
+a = which(simCut %in% mostSimilar, arr.ind = TRUE, useNames = T)
+index = arrayInd(a, .dim = dim(simCut))
+result = rownames(sim1)[index[,1]]
+result
+filter(newdata,item_id %in% result) %>% dplyr::select(title, item_id)
+
+mostSimilar = data.frame(item_id = as.numeric(result),
+                         similar = simCut[index])
+
+mostSimilar %>% left_join(newdata) %>% select(item_id, title, similar) %>% arrange(-similar)
+```
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+max_rating=ratings %>% select(-item_id) %>% group_by (user_id) %>% summarise(user_id=user_id, maximum=max(rating)) %>% unique() 
+#максимальная оценка, которую ставил пользователь: если самая высокая оценка ниже 4, то рекомендация выдается на основе наименее схожих фильмов с самым низко оцененным фильмом пользователя
+min_rating=ratings %>% select(-item_id) %>% group_by (user_id) %>% summarise(user_id=user_id, minimum=min(rating)) %>% unique() 
+#минимальная оценка, которую ставил пользователь
+```
+
+Функция:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+getContentBasedRecommendation=function(userId){
+ 
+  if (userId %in% ratings$user_id == 0){
+    rec_s=metadata$title[match(top_movies, metadata$item_id)]
+  } else {
+    
+    max_rating=max_rating %>% filter(user_id==userId)#находим максимальную оценку, поставленную искомым юзером - ищем фильмы по схожести с максимально оцененными этим пользователем 
+    
+    if (max_rating$maximum>=4){
+      user = ratings %>% filter(user_id == userId & rating == max_rating$maximum) 
+      simCut = sim1[,as.character(user$item_id)]
+      
+      mostSimilar = head(sort(simCut, decreasing = T), n = 10)
+      
+      a = which(simCut %in% mostSimilar, arr.ind = T, useNames = T)
+      ## выдается результат "общим" индексом, а не строки-столбцы, нам нужны строки
+      index = arrayInd(a, .dim = dim(sim1))
+      
+      # id фильмов
+      result = rownames(sim1)[index[,1]]
+      
+      mostSimilar = data.frame(item_id = as.numeric(result),
+                               similar = simCut[index])
+      
+      recs=mostSimilar %>% left_join(newdata) %>% select(item_id, title, similar) %>% arrange(-similar)
+      for_delite = survey_answers %>% 
+        filter(user_id == userId)
+      rec_s = anti_join(recs, for_delite) 
+    } else {
+      
+      min_rating=min_rating %>% filter(user_id==userId)#минимальная оценка пользователя для поиска наименее похожих фильмов
+      
+      user = ratings %>% filter(user_id == userId & rating == min_rating$minimum) 
+      simCut = sim1[,as.character(user$item_id)]
+      
+      lessSimilar = tail(sort(simCut, decreasing = T), n = 10)
+      
+      a = which(simCut %in% lessSimilar, arr.ind = T, useNames = T)
+      # выдается результат "общим" индексом, а не строки-столбцы, нам нужны строки
+      index = arrayInd(a, .dim = dim(sim1))
+      
+      # id фильмов
+      result = rownames(sim1)[index[,1]]
+      
+      lessSimilar = data.frame(item_id = as.numeric(result),
+                               similar = simCut[index])
+      lessSimilar= lessSimilar %>% top_n(-lessSimilar$similar, n=10)
+      
+      recs=lessSimilar %>% left_join(newdata) %>% select(item_id, title, similar) %>% arrange(similar)
+      for_delite = ratings %>% 
+        filter(user_id == userId)
+      rec_s = anti_join(recs, for_delite) 
+      }}
+ rec_s
+  
+}
+```
+
+Пример работы функции:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+userId=77170#предполагается ввод индекса в формате числа
+
+getContentBasedRecommendation(userId)
+```
+
+**Оценивание рекомендации:** Для оценки качества content-based модели
+использовалась проверка на адекватность и внутренняя оценка.
+
+**Внутренняя оценка**
+
+Возьмём всё того же пользователя любителя приключений и ужасов, юзера
+под номером 633629.
+
+Подставим его в функцию:
+
+```{r message=FALSE, warning=FALSE}
+userId=633629#предполагается ввод индекса в формате числа
+
+getContentBasedRecommendation(userId)
+```
+
+Мы видим, что юзер получил рекомендации, которые также являются
+приключенческими фильмами. Выбросов как таковых нет, что говорит об
+успешной конструкции функции. Интересно, что рекомендации с IBCF системы
+практически не повторились в CB системе.
+
+**Проверка на адекватность** Сравнивались характеристики фильмов,
+которые нравятся пользователю, и тех, которые рекомендуются. Это
+включало в себя сравнение средней оценки фильмов и сравнение
+распредления доли жанров фильмов.
+
+Возьмем пользователя 38859. Найдем характеристики фильмов, которые ему
+нравятся,и характеристики рекомендаций
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+user = ratings %>% filter(user_id == 38859 & rating == 5)
+
+liked <- filter(newdata,item_id %in% user$item_id)
+recs <- filter(newdata,item_id %in% mostSimilar$item_id)
+```
+
+Проведем сравнение средней оценки фильмов, которые нравятся
+пользователю, с рекомендованными.
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+mean_liked <- mean(liked$avgRating)
+mean_recs <- mean(recs$avgRating)
+
+cat("Средняя оценка фильмов, которые нравятся пользователю:", mean_liked, "\n")
+cat("Средняя оценка рекомендованных фильмов:", mean_recs, "\n")
+
+dif_mean = mean_liked - mean_recs
+cat("Разница средних: ", dif_mean)
+```
+
+Сравнение доли распределения жанров. Посчитаем, как часто тот или иной
+жанр встречается в любимых фильмах пользователя, и сравним с частотой
+распределения жанров рекомендаций.
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+liked_genre_counts <- colSums(liked[, 16:37])
+liked_genre_proportions <- liked_genre_counts / nrow(liked)
+liked_genre_proportions <- liked_genre_proportions[order(liked_genre_proportions, decreasing = TRUE)]
+
+recs_genre_counts <- colSums(recs[, 16:37])
+recs_genre_proportions <- recs_genre_counts / nrow(recs)
+recs_genre_proportions <- recs_genre_proportions[order(recs_genre_proportions, decreasing = TRUE)]
+
+
+```
+
+Преобразуем данные в датафреймы и выведем таблицу с разницей долей
+понравившихся и рекомендованных фильмов.
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+liked_genre_df <- data.frame(genre = names(liked_genre_proportions), proportion = liked_genre_proportions, row.names = NULL)
+
+recs_genre_df <- data.frame(genre = names(recs_genre_proportions), proportion = recs_genre_proportions, row.names = NULL)
+
+genre_diff <- recs_genre_df %>% select(genre) 
+genre_diff$difference = liked_genre_df$proportion - recs_genre_df$proportion
+
+genre_diff
+
+```
+
+В случае со средней оценкой разница оказалась всего 0.029, т. е.
+рейтинги понравившихся фильмов и рейтинг рекомендаций примерно
+одинаковый. В сравнении частоты жанров можно сделать следующие выводы:
+жанры с отрицательным значением чаще встречаются в рекомендациях, а с
+положительным значением - в понравившихся. Жанры со значением, равным 0,
+имеют одинаковое распределение в понравившихся фильмах пользователя и
+рекомендациях. Отрицательные значения указывают на преимущественное
+предпочтение других жанров, а положительные значения говорят о наличии
+дополнительных жанров в рекомендациях, которые могут быть интересны
+пользователю. Значения равные нулю указывают на совпадение распределения
+жанров в обоих случаях. Стоит отметить, что разница во всех случаях
+оказалась минимальной, что говорит о высокой степени качества нашей
+модели.
+
+### Примеры
+
+В рамках peer review мы получили несколько предложений того, какие
+примеры нам стоит рассмотреть в нашей рекомендации. Мы разделим их на
+несколько групп, так как часть наших и предложенных примеров была похожа
+по логике. Рассмотрим примеры на collaborative filtering системе.
+
+**1. Случай, когда пользователя в системе нет или у него мал оценок**
+Например, пользователя нет в системе (сделаем для нескольких новых
+пользователей, чтобы убедиться, что все получают одинаковый топ-10
+фильмов)
+
+```{r}
+userId=0000 #предполагается ввод индекса в формате числа
+getUserBasedRecommendation(userId)
+```
+
+```{r}
+userId=9999 #предполагается ввод индекса в формате числа
+getUserBasedRecommendation(userId)
+```
+
+Аналогично и для пользователя с малым числом оценок (тк мы отсекали
+людей с менее чем 10 оценками) Возьмем user_id 192, тк у данного
+пользователя всего 5 оценок и снова видим рекомендацию топ-10 фильмов
+
+```{r}
+userId=192 #предполагается ввод индекса в формате числа
+getUserBasedRecommendation(userId)
+```
+
+**2. Рекомендации для пользователя, который предпочитает определенные
+жанры** Нам предложили посмотреть, что будет рекомендовано пользователю,
+которому нравятся фильмы "Lilo & Stitch (2002)", "Cable Guy, The
+(1996)", "Garden State (2004)", "Dazed and Confused (1993)". Также
+просили проверить, что будет, если ввести определенный жанр, например
+мультфильмы. Мы обобщим эти два запроса. У наших систем не предусмотрена
+возмжность давать рекомендации по жанру, однако мы решили проверить,
+насколько рекомендации соответствуют любимому жанру пользователя. Было
+достаточно cложно выбрать человека, который бы ставил высокие оценки
+только одному жанру и при этом оценил более 10 фильмов, поэтому возьмем
+user id 2543. Этот человек ставил высокие оценки мультфильмам (Южный
+парк, Суперсемейка и др) и драмам/романтическим фильмам (Форрест Гамп,
+Умница Уилл Хантинг). Выведем рекомендации для него:
+
+```{r}
+userId=2543 #предполагается ввод индекса в формате числа
+getUserBasedRecommendation(userId)
+```
+
+Видим, что большинство фильмов соответствуют его любимым жанрам, есть
+как рекомендации мультфильмов, например, Зверополис, Корпорация
+Монстров, Унесенные призраками, так и драмы (в том числе романтические),
+такие как Красота по-американски, Гранд-Каньон и даже один
+документальный фильм. В целом, рекомендация довольно хорошая, особенно с
+точки зрения разнообразия, но особенно стоит отметить рекомендации
+мультфильмов (все супер).
+
+**3. Пользователь с противоречивыми предпочтениями** Нас попросили
+изучить, что порекомендуют пользователю, который оценил высоко фильмы:
+ужастик "Кошмар на улице вязов" и комедия "Мальчишник в Вегасе". Данного
+ужастика у нас нет в датасете, так что возьмем пользователя, который
+поставил пятерки "Мальчишнику в Вегасе" и "28 дней спустя"
+(Ужасы/Научная фантастика) и посмотрим на рекомендации (также в этом
+примере мы посмотрим, будет ли гарантированно рекомендована 2 часть
+фильма, который был высоко оценен пользователем):
+
+```{r}
+userId=466317 
+getUserBasedRecommendation(userId)
+```
+
+Видим рекомендации как ужасов/драм (Let the Right One In, Rounders, Army
+of Darkness), так и комедии и даже мультики (Up, Paperman, Despicable
+Me). Но все таки идет больше уклон в драмы и ужасы. Вторая часть
+"Мальчишника в Вегасе" пользователю не рекомендована, вероятно, это
+произошло потому что он поставил много полжительных оценок и фильмам
+других жанров + разные части фильмов мгут сильно различаться и оень
+часто бывает такое, что 2+ части фильмов зрители оценивают сильно ниже
+первой части.
+
+### Проверка предложенного сценария (по итогам оценки черновиков отчета по проекту)
+
+Предложено посмотреть на рекомендацию фильмов пользователю, котрому
+нравятся фильмы с Джимом Керри и сравнить рекомендации методом CF и CB.
+**CF** Сначала попробуем на примере уже имеюшегося пользователя:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+userId=65192 #предполагается ввод индекса в формате числа
+getUserBasedRecommendation(userId)
+```
+
+Мы видим довольно противоречивые рекмендации: есть как
+драмы/романтические фильмы (Erin Brockovich, Slumdog Millionaire), так и
+приключения (Expendables), комедии (Maverick, Ratatouille), и даже
+ужасы/триллеры (What Lies Beneath). Видим, что рекомендации очень разные
+по жанрам и средих мало комедий, в которых часто снимается Джим Керри, а
+самих фильмов с ним больше нет.
+
+Теперь добавим любителя фильмов с Джимом Керри (для этого придется
+вернуться к пстроению матрицы, так как пользователя нужно добавлять к
+исходному датафрейму)
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+jim_carrey_fan = data.frame(item_id = c(27706, 3988, 471, 153, 19, 3752, 318, 5618, 44555, 800, 177765, 80463, 2, 87430, 8360, 52885),
+                            user_id = c(9990000, 9990000, 9990000, 9990000, 9990000, 9990000, 9990000, 9990000, 9990000, 9990000, 9990000, 9990000, 9990000, 9990000, 9990000, 9990000),
+                            rating = c(5.0, 5.0, 0.5, 5.0, 5.0, 5.0, 2.0, 2.0, 2.0, 2.0, 3.0, 2.5, 3.0, 1.5, 3.0, 2.0))
+ratings = rbind(ratings, jim_carrey_fan)
+
+rates = pivot_wider(ratings, names_from = item_id, values_from = rating) 
+userNames = rates$user_id
+rates = select(rates, -user_id)
+rates = as.matrix(rates)
+rownames(rates) = userNames
+r = as(rates, "realRatingMatrix", strict = T)
+ratings_movies <- r[rowCounts(r) > 15, colCounts(r) > 10]
+
+set.seed(100) 
+    eval_sets <- evaluationScheme(data = ratings_movies, 
+                                method = "split",
+                                train = 0.8, # доля обучающей выборки
+                                given = 15, # сколько оценок используется для  предсказания
+                                goodRating = 4) # если предсказанная оценка < 4, то фильм не рекомендуем
+
+recc_model_UB = Recommender(data = getData(eval_sets, "train"), method ="UBCF")
+recc_predicted = predict(object = recc_model_UB, newdata = ratings_movies, n = 10) 
+
+getUserBasedRecommendation(9990000)
+```
+
+Видим опять же очень пртиворечивые рекомендации, среди них снова нет
+фильмов с Джимом Керри. Есть комедии, например Mrs. Doubtfire, триллеры
+и боевики, например Hunt for Red October, так и драмы, такие как Match
+Point. Опять же очень разнобразные рекмендации, которые объясняются
+скорее сутью User-Based рекомендательной системы, чем похожестью
+фильмов.
+
+Теперь посмотрим на примере работы CB системы. Оценим пользователя,
+который уже был в системе:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+getContentBasedRecommendation(65192)
+```
+
+Для пользователя, который уже был в системе, не были подобраны фильмы с
+Керри, что может быть связано с тем, что пользователь посмотрелвсе
+фильмы с данным актёром (повторы фильтруются), либо с тем, что система
+просто проигнорировала этот факт.
+
+### Выводы
+
+В ходе работы мы провели сетевой и текстовый анализ данных о фильмах и
+пользователях, а также построили модели коллаборативной фильтрации (CF)
+и контентной базы (CB) для рекомендации фильмов и оценили их несколькими
+способами. В результате в нашем проекте мы получили две системы, которые
+позволяют пользователю получить рекомендации фильмов, введя свой id
+пользователя.
+
+В рамках проведенного текстового анализа, мы добавили датасет с
+описаниями фильмов, а также смогли получить новую характеристику -
+оценку тональности, которая затем была использована в построении модели
+CB. Сетевой анализ, который был реализован с помощью Python и R,
+позволил нам построить сеть, где связями являются актеры, игравшие в
+нескольких фильмах, и выделить коммьюнити по фильмам, которые также
+использовались в построении модели.
+
+Также мы построили модель CF, которая основывается на имеющихся оценках
+пользователя и рекомендует ему фильмы с высокой предсказанной оценкой. А
+также мы создали CB модель, которая учитывает не только среднюю оценку
+фильма, но и жанр, тональность коммьюнити, а также десятилетие выхода
+фильма. Последний показатель вызвал много вопросов, однако нам
+показалось, что он вполне логично вписывается в нашу рекомендательную
+модель, так как часто случаются ситуации, когда пользователи
+предпочитают смотреть только фильмы из определенной эпохи. Фильмы,
+выпущенные в одно десятилетие, часто имеют схожие стили, тематику и
+характеристики, а использование этого параметра в модели позволяет
+учесть данный аспект.
+
+Далее мы превратили обе модели в функции и провели их оценку разными
+методами, в результате чего мы сделали выводы о точности и адекватности
+модели. И наконец, мы представили самые интересные и наглядные примеры
+их работы. Благодаря примерам из peer review и нашим собственным идеям,
+мы смогли продемонстрировать, как работают наши рекомендательные системы
+и оценить их работу еще более наглядно.
+
+Таким образом, в рамках данного проекта мы смогли ближе познакомиться с
+построением рекомендательных систем, понять, как текстовый и сетевой
+анализ могут помочь нам в этом вопросе. В результате нашей работы мы
+провели комплексный анализ данных о фильмах и пользователях, построили
+модели CF и CB для рекомендации фильмов. Также, хочется отметить, что мы
+смогли отлично наладить работу в команде, четко распределять
+обязанности, вместе находить ошибки и неточности в работе и устранять
+их. Полученные нами модели могут быть полезны для создания
+персонализированных рекомендаций фильмов
+
+### Ответы на вопросы peer review
+
+**Вопрос: Как были выбраны границы для фильтрации исходного датасета при
+построении модели CF?**
+
+*Ответ:*\
+Изначально мы руками протестировали несколько значений, при которых все
+корректно работало и оставили значение с наилучшей RMSE полученной
+модели. Затем, мы решили запустить цикл, чтобы проверить, можно ли
+добиться еще лучшего качества по метрикам. Получили, что нужно оставлять
+фильмы с не менее чем 5 оценками и пользователей с 30+ оценками, однако
+это бы слишком урезало данные, поэтому мы оставили изначально выбранные
+значение 10 (пользователи) и 15 (фильмы), чтобы не слишком сокращать
+выборку, но при этом сохранить неплохие значения метрик.
+
+```{r eval=FALSE, include=FALSE}
+count_RMSE <- function(ratings_movies) {
+  
+  recc_model_IB <- Recommender(data = getData(eval_sets, "train"), method ="IBCF")
+
+  recc_predicted_IB <- 
+    predict(
+      object = recc_model_IB,
+      newdata = getData(eval_sets, "known"),
+      n = 6,
+      type = "ratings"
+    )
+  
+  eval_accuracy_IB <- calcPredictionAccuracy(
+      x = recc_predicted_IB,# predicted values
+      data = getData(eval_sets, "unknown"),
+      byUser = F) # not averaging for each user
+  
+  recc_model_UB <-
+  Recommender(data = getData(eval_sets, "train"), method ="UBCF")
+
+  recc_predicted_UB <-
+    predict(
+      object = recc_model_UB,
+      newdata = getData(eval_sets, "known"),
+      n = 6,
+      type = "ratings"
+    )
+  
+  eval_accuracy_UB <- calcPredictionAccuracy(
+      x = recc_predicted_UB,# predicted values
+      data = getData(eval_sets, "unknown"),
+      byUser = F) # not averaging for each user
+  
+  return( min(unname(eval_accuracy_UB)[1], unname(eval_accuracy_IB)[1]))
+}
+```
+
+```{r eval=FALSE, include=FALSE}
+min_value <- Inf  # Инициализация переменной для минимального значения
+min_i <- NULL    # Переменная для хранения значения i с минимальным значением
+min_j <- NULL    # Переменная для хранения значения j с минимальным значением
+
+for (i in 5:30) {
+  set.seed(100)
+  eval_sets <- evaluationScheme(data = ratings_movies, 
+                                method = "split",
+                                train = 0.8, # доля обучающей выборки
+                                given = i, # сколько оценок используется для  предсказания
+                               goodRating = 4) # если предсказанная оценка < 4, то фильм не рекомендуем
+  for (j in 5:20) {
+    ratings_movies <- r[rowCounts(r) > i, colCounts(r) > j] 
+    result = count_RMSE(ratings_movies)
+    
+    # Проверка, является ли текущее значение минимальным
+    if (result < min_value) {
+      min_value <- result
+      min_i <- i
+      min_j <- j
+    }
+  }
+}
+print(min_i)
+print(min_j)
+min_value
+```
+
+**Вопрос: Почему использовали уже существующий словарь afinn, а не
+создали свой или любой другой?**
+
+*Ответ:* Наша задача была оценить фильмы на тональность, словарь afinn
+хорошо для этого подходил, так как в нем "оценки" слов были в виде
+вещественных чисел, это очень удобно для оценки общей тональности
+фильма. Мы рассматривали другие словари из get_sentiments. Bing не
+подошел, так как там было просто разделение на positive/negativе, без
+градации, какое слово более негативное, а какое позитивное. Loughran не
+подошел по такой же причине. А словарь nrc просто показывал "чувства",
+нам это не подходило. Создавать свой собственный словарь мы не стали,
+так как это не имело смысла. Словарь afinn удовлетворял полностью нашим
+требованиям.
